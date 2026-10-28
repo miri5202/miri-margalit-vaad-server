@@ -62,7 +62,7 @@ router.get('/', async (req, res, next) => {
 });
 
 // GET /payments-grid?year=2026 - טבלת "מי שילם" (ועד)
-// שורה לכל דירה ולכל יחידת דיור: שמות הדיירים ו-12 חודשים, בכל חודש: paid / pending / late / none
+// שורה לכל דירה ולכל יחידת דיור: שמות הדיירים ו-12 חודשים, בכל חודש: paid / partial / pending / late / none
 // יחידת דיור מופיעה מיד אחרי הדירה שלה (isUnit = true, למשל "3א")
 router.get('/payments-grid', requireAdmin, async (req, res, next) => {
   try {
@@ -82,12 +82,16 @@ router.get('/payments-grid', requireAdmin, async (req, res, next) => {
        GROUP BY s.apt, s.is_unit
        ORDER BY s.apt, s.is_unit`, [buildingId, req.building.apartmentsCount, req.building.unitApartments]);
 
-    // לכל דירה/יחידה וחודש - הסטטוס "הטוב ביותר" (אם יש כמה תשלומים באותו חודש, "שולם" גובר)
+    // לכל דירה/יחידה וחודש - סטטוס אחד מכל התשלומים של אותו חודש:
+    //   הכול שולם ← paid.  חלק שולם וחלק פתוח (תשלום חלקי) ← partial.
+    //   שום דבר לא שולם ← late אם יש חיוב באיחור, אחרת pending
     const fees = await pool.query(`
       SELECT apartment, is_unit AS "isUnit",
              EXTRACT(MONTH FROM date)::int AS month,
-             CASE MAX(CASE status WHEN 'paid' THEN 3 WHEN 'late' THEN 2 WHEN 'pending' THEN 1 END)
-               WHEN 3 THEN 'paid' WHEN 2 THEN 'late' ELSE 'pending' END AS status
+             CASE WHEN BOOL_AND(status = 'paid') THEN 'paid'
+                  WHEN BOOL_OR(status = 'paid') THEN 'partial'
+                  WHEN BOOL_OR(status = 'late') THEN 'late'
+                  ELSE 'pending' END AS status
         FROM transactions
        WHERE building_id = $1 AND type = 'income' AND category = 'monthly_fee'
          AND EXTRACT(YEAR FROM date) = $2

@@ -189,25 +189,82 @@ router.put('/:id', requireAdmin, async (req, res, next) => {
 });
 
 // PATCH /:id/pay - "סמן כשולם" בלחיצה אחת (ועד)
-// גוף (לא חובה): { paymentMethod }. התאריך לא משתנה, כדי שהחיוב יישאר משויך לחודש שלו
+// גוף (לא חובה): { paymentMethod, amount }
+//   התאריך לא משתנה, כדי שהחיוב יישאר משויך לחודש שלו
+//   amount - תשלום חלקי: אם הדייר שילם פחות מהחיוב (למשל 100 מתוך 150), החיוב מתפצל לשניים:
+//            100 ← "שולם",  50 ← חיוב חדש עם הסטטוס הקודם (ממתין / באיחור) והתיאור "(יתרה)"
+//   מחזיר: התשלום ששולם. בתשלום חלקי יש בו גם remainder = חיוב היתרה החדש
 router.patch('/:id/pay', requireAdmin, async (req, res, next) => {
+  const method = req.body.paymentMethod;
+  if (method !== undefined && !PAYMENT_METHODS.includes(method)) {
+    return sendIfInvalid(res, { paymentMethod: 'אמצעי תשלום לא תקין' });
+  }
+  const hasAmount = req.body.amount !== undefined && req.body.amount !== null && req.body.amount !== '';
+  const amount = Number(req.body.amount);
+  if (hasAmount && !(amount > 0)) {
+    return sendIfInvalid(res, { amount: 'הסכום חייב להיות מספר חיובי' });
+  }
+
+  const client = await pool.connect(); // שתי הפעולות (עדכון + יתרה) בטרנזקציה אחת
   try {
-    const method = req.body.paymentMethod;
-    if (method !== undefined && !PAYMENT_METHODS.includes(method)) {
-      return sendIfInvalid(res, { paymentMethod: 'אמצעי תשלום לא תקין' });
+    await client.query('BEGIN');
+    // FOR UPDATE - נועל את השורה, כדי ששתי לחיצות במקביל לא יפצלו את אותו חיוב פעמיים
+    const found = await client.query(
+      `SELECT ${COLUMNS} FROM transactions
+        WHERE id = $1 AND building_id = $2 AND type = 'income'
+        FOR UPDATE`,
+      [req.params.id, req.building.id]
+    );
+    const tx = found.rows[0];
+    if (!tx) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'התשלום לא נמצא' });
     }
 
-    const { rows } = await pool.query(
+    const isPartial = hasAmount && amount < tx.amount;
+    if (hasAmount) {
+      let error = null;
+      if (tx.status === 'paid') error = 'התשלום הזה כבר שולם';
+      else if (amount > tx.amount) error = `הסכום גדול מהחיוב (${tx.amount} ₪)`;
+      if (error) {
+        await client.query('ROLLBACK');
+        return sendIfInvalid(res, { amount: error });
+      }
+    }
+
+    const { rows } = await client.query(
       `UPDATE transactions
-          SET status = 'paid', payment_method = COALESCE($1, payment_method), updated_at = NOW()
-        WHERE id = $2 AND building_id = $3 AND type = 'income'
+          SET status = 'paid', payment_method = COALESCE($1, payment_method),
+              amount = CASE WHEN $2::numeric IS NULL THEN amount ELSE $2::numeric END,
+              updated_at = NOW()
+        WHERE id = $3
         RETURNING ${COLUMNS}`,
-      [method || null, req.params.id, req.building.id]
+      [method || null, isPartial ? amount : null, tx.id]
     );
-    if (!rows[0]) return res.status(404).json({ message: 'התשלום לא נמצא' });
-    res.json(rows[0]);
+    const paid = rows[0];
+
+    if (isPartial) {
+      // חיוב היתרה: אותה דירה, אותו תאריך ואותו סטטוס - כך הוא נשאר חוב של אותו חודש
+      const remainder = Math.round((tx.amount - amount) * 100) / 100;
+      const description = `${tx.description || 'דמי ועד'} (יתרה)`.slice(0, 500);
+      const created = await client.query(
+        `INSERT INTO transactions
+           (building_id, type, amount, date, category, apartment, is_unit, payment_method, status, description, created_by)
+         VALUES ($1, 'income', $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         RETURNING ${COLUMNS}`,
+        [req.building.id, remainder, tx.date, tx.category, tx.apartment, tx.isUnit, tx.paymentMethod,
+         tx.status, description, req.user.id]
+      );
+      paid.remainder = created.rows[0];
+    }
+
+    await client.query('COMMIT');
+    res.json(paid);
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
     next(err);
+  } finally {
+    client.release();
   }
 });
 
