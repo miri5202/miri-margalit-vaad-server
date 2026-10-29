@@ -2,6 +2,7 @@
 // הבניין כבר נבדק ונטען ב-loadBuilding (req.building)
 const express = require('express');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const pool = require('../config/db');
 const { requireAdmin } = require('../middleware/auth');
 const { validateUser, sendIfInvalid } = require('../validation/validators');
@@ -12,6 +13,9 @@ const router = express.Router({ mergeParams: true });
 router.use(requireAdmin);
 
 const USER_COLUMNS = `id, full_name AS "fullName", email, role, building_id AS "buildingId", apartment, is_unit AS "isUnit", phone`;
+
+// דייר בלי פרטי התחברות מקבל סיסמה אקראית שאף אחד לא יודע (העמודה במסד היא חובה)
+const randomPasswordHash = () => bcrypt.hash(crypto.randomBytes(24).toString('hex'), 10);
 
 // GET - רשימת הדיירים בבניין, ממוינת לפי מספר דירה
 router.get('/', async (req, res, next) => {
@@ -27,13 +31,15 @@ router.get('/', async (req, res, next) => {
 });
 
 // POST - הוספת דייר לבניין
-// גוף: { fullName, email?, phone?, password, apartment, isUnit? }
+// גוף: { fullName, email?, phone?, password?, apartment, isUnit? }
+//   אימייל וטלפון לא חובה. אם יש אחד מהם - חובה סיסמה (כדי שהדייר יוכל להתחבר).
+//   בלי שניהם - הדייר רשום רק לפי שם ודירה, ולא מתחבר למערכת
 router.post('/', async (req, res, next) => {
   try {
-    const { data, errors } = validateUser(req.body, { isNew: true, building: req.building });
+    const { data, errors } = validateUser(req.body, { isNew: true, building: req.building, requireLogin: false });
     if (sendIfInvalid(res, errors)) return;
 
-    const hash = await bcrypt.hash(data.password, 10);
+    const hash = data.password ? await bcrypt.hash(data.password, 10) : await randomPasswordHash();
     const { rows } = await pool.query(
       `INSERT INTO users (full_name, email, password, role, building_id, apartment, is_unit, phone)
        VALUES ($1, $2, $3, 'resident', $4, $5, $6, $7)
@@ -56,7 +62,12 @@ router.put('/:id', async (req, res, next) => {
     if (!existing.rows[0]) return res.status(404).json({ message: 'הדייר לא נמצא' });
 
     // ממזגים: מה שלא נשלח נשאר כמו שהיה
-    const { data, errors } = validateUser({ ...existing.rows[0], ...req.body }, { isNew: false, building: req.building });
+    const old = existing.rows[0];
+    const { data, errors } = validateUser({ ...old, ...req.body }, { isNew: false, building: req.building, requireLogin: false });
+    // לדייר שלא היו לו פרטי התחברות מוסיפים עכשיו אימייל / טלפון - צריך גם סיסמה, אחרת לא יוכל להתחבר
+    if (!old.email && !old.phone && (data.email || data.phone) && !data.password) {
+      errors.password = 'יש להזין סיסמה, כדי שהדייר יוכל להתחבר';
+    }
     if (sendIfInvalid(res, errors)) return;
 
     const hash = data.password ? await bcrypt.hash(data.password, 10) : null;

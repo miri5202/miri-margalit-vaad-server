@@ -116,11 +116,11 @@ router.get('/payments-grid', requireAdmin, async (req, res, next) => {
 });
 
 // GET /debtors - רשימת חייבים (ועד): כל דירה / יחידת דיור שיש לה תשלומים ממתינים או באיחור
-// מחזיר לכל דירה: סכום החוב, כמה חיובים פתוחים, כמה מהם באיחור, ופרטי הדיירים - שם, טלפון ואימייל (לשליחת תזכורת)
+// מחזיר לכל דירה: סכום החוב, כמה חיובים פתוחים, כמה מהם באיחור, כמה מהם יתרות של תשלום חלקי, ופרטי הדיירים - שם, טלפון ואימייל (לשליחת תזכורת)
 router.get('/debtors', requireAdmin, async (req, res, next) => {
   try {
     const { rows } = await pool.query(`
-      SELECT d.apartment, d.is_unit AS "isUnit", d.debt, d."openCount", d."lateCount", d."oldestDate",
+      SELECT d.apartment, d.is_unit AS "isUnit", d.debt, d."openCount", d."lateCount", d."partialCount", d."oldestDate",
              COALESCE(
                (SELECT json_agg(json_build_object('fullName', u.full_name, 'phone', u.phone, 'email', u.email) ORDER BY u.full_name)
                   FROM users u WHERE u.building_id = $1 AND u.apartment = d.apartment AND u.is_unit = d.is_unit),
@@ -130,6 +130,7 @@ router.get('/debtors', requireAdmin, async (req, res, next) => {
                  SUM(amount)::float8 AS debt,
                  COUNT(*)::int AS "openCount",
                  COUNT(*) FILTER (WHERE status = 'late')::int AS "lateCount",
+                 COUNT(*) FILTER (WHERE partial_of IS NOT NULL)::int AS "partialCount",
                  to_char(MIN(date), 'YYYY-MM-DD') AS "oldestDate"
             FROM transactions
            WHERE building_id = $1 AND type = 'income' AND status IN ('pending', 'late')

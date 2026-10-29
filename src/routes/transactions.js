@@ -9,15 +9,19 @@ const { PAYMENT_METHODS } = require('../config/constants');
 const router = express.Router({ mergeParams: true });
 
 // העמודות שחוזרות ללקוח (שמות ב-camelCase, סכום כמספר, תאריך כ-YYYY-MM-DD)
+// status: במסד יש 3 סטטוסים (paid / pending / late). ללקוח מוצג גם סטטוס רביעי - partial ("שולם חלקית"):
+//   יתרה פתוחה של תשלום חלקי (יש לה partial_of). במסד היא עדיין pending / late, כך שכל חישובי החוב לא משתנים
+const DISPLAY_STATUS = `CASE WHEN partial_of IS NOT NULL AND status <> 'paid' THEN 'partial' ELSE status END`;
 const COLUMNS = `
   id, building_id AS "buildingId", type, amount::float8 AS amount, to_char(date, 'YYYY-MM-DD') AS date,
-  category, apartment, is_unit AS "isUnit", supplier, payment_method AS "paymentMethod", status,
+  category, apartment, is_unit AS "isUnit", supplier, payment_method AS "paymentMethod",
+  ${DISPLAY_STATUS} AS status, partial_of AS "partialOf",
   description, created_by AS "createdBy", created_at AS "createdAt", updated_at AS "updatedAt"`;
 
 // שדות שמותר למיין לפיהם ← שם העמודה בטבלה
 const SORT_COLUMNS = {
   date: 'date', amount: 'amount', createdAt: 'created_at',
-  apartment: 'apartment', category: 'category', status: 'status',
+  apartment: 'apartment', category: 'category', status: DISPLAY_STATUS,
 };
 
 // בונה תנאי WHERE מתוך פרמטרי ה-URL
@@ -31,7 +35,10 @@ function buildWhere(q, conditions = [], params = []) {
 
   if (q.type) add('type = ?', q.type);
   if (q.category) add('category = ?', q.category);
-  if (q.status) add('status = ?', q.status);
+  // partial = יתרות פתוחות של תשלום חלקי. ממתין / באיחור - בלי היתרות (הן מוצגות כ"שולם חלקית")
+  if (q.status === 'partial') conditions.push("(partial_of IS NOT NULL AND status <> 'paid')");
+  else if (q.status === 'pending' || q.status === 'late') add('(status = ? AND partial_of IS NULL)', q.status);
+  else if (q.status) add('status = ?', q.status);
   if (q.paymentMethod) add('payment_method = ?', q.paymentMethod);
   if (q.apartment && /^\d+$/.test(q.apartment)) add('apartment = ?', Number(q.apartment));
 
@@ -164,13 +171,17 @@ router.post('/', requireAdmin, async (req, res, next) => {
 router.put('/:id', requireAdmin, async (req, res, next) => {
   try {
     const existing = await pool.query(
-      `SELECT ${COLUMNS} FROM transactions WHERE id = $1 AND building_id = $2`,
+      `SELECT ${COLUMNS}, status AS "dbStatus" FROM transactions WHERE id = $1 AND building_id = $2`,
       [req.params.id, req.building.id]
     );
     if (!existing.rows[0]) return res.status(404).json({ message: 'התנועה לא נמצאה' });
 
     // ממזגים את הישן עם החדש ובודקים את התוצאה המלאה
-    const { data, errors } = validateTransaction({ ...existing.rows[0], ...req.body }, req.building);
+    // "שולם חלקית" הוא סטטוס תצוגה בלבד - אם הוא נשלח, משאירים את הסטטוס שבמסד
+    const current = { ...existing.rows[0], status: existing.rows[0].dbStatus };
+    const changes = { ...req.body };
+    if (changes.status === 'partial') delete changes.status;
+    const { data, errors } = validateTransaction({ ...current, ...changes }, req.building);
     if (sendIfInvalid(res, errors)) return;
 
     const { rows } = await pool.query(
@@ -210,7 +221,7 @@ router.patch('/:id/pay', requireAdmin, async (req, res, next) => {
     await client.query('BEGIN');
     // FOR UPDATE - נועל את השורה, כדי ששתי לחיצות במקביל לא יפצלו את אותו חיוב פעמיים
     const found = await client.query(
-      `SELECT ${COLUMNS} FROM transactions
+      `SELECT ${COLUMNS}, status AS "dbStatus" FROM transactions
         WHERE id = $1 AND building_id = $2 AND type = 'income'
         FOR UPDATE`,
       [req.params.id, req.building.id]
@@ -224,7 +235,7 @@ router.patch('/:id/pay', requireAdmin, async (req, res, next) => {
     const isPartial = hasAmount && amount < tx.amount;
     if (hasAmount) {
       let error = null;
-      if (tx.status === 'paid') error = 'התשלום הזה כבר שולם';
+      if (tx.dbStatus === 'paid') error = 'התשלום הזה כבר שולם';
       else if (amount > tx.amount) error = `הסכום גדול מהחיוב (${tx.amount} ₪)`;
       if (error) {
         await client.query('ROLLBACK');
@@ -245,15 +256,17 @@ router.patch('/:id/pay', requireAdmin, async (req, res, next) => {
 
     if (isPartial) {
       // חיוב היתרה: אותה דירה, אותו תאריך ואותו סטטוס - כך הוא נשאר חוב של אותו חודש
+      // partial_of = התשלום ששולם עכשיו, כך שהיתרה מוצגת כ"שולם חלקית"
       const remainder = Math.round((tx.amount - amount) * 100) / 100;
       const description = `${tx.description || 'דמי ועד'} (יתרה)`.slice(0, 500);
       const created = await client.query(
         `INSERT INTO transactions
-           (building_id, type, amount, date, category, apartment, is_unit, payment_method, status, description, created_by)
-         VALUES ($1, 'income', $2, $3, $4, $5, $6, $7, $8, $9, $10)
+           (building_id, type, amount, date, category, apartment, is_unit, payment_method, status, description,
+            created_by, partial_of)
+         VALUES ($1, 'income', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          RETURNING ${COLUMNS}`,
         [req.building.id, remainder, tx.date, tx.category, tx.apartment, tx.isUnit, tx.paymentMethod,
-         tx.status, description, req.user.id]
+         tx.dbStatus, description, req.user.id, tx.id]
       );
       paid.remainder = created.rows[0];
     }

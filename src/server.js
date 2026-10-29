@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const pool = require('./config/db');
 const errorHandler = require('./middleware/errorHandler');
+const { migrate } = require('./db/migrate');
 
 const app = express();
 
@@ -52,6 +53,7 @@ async function start() {
   if (!process.env.JWT_SECRET) throw new Error('חסר JWT_SECRET בקובץ .env');
   await pool.query('SELECT 1'); // בודק שהמסד זמין לפני שמתחילים
   console.log('✅ מחובר למסד הנתונים');
+  await migrate(pool); // עדכוני מבנה קטנים למסד קיים (בלי למחוק נתונים)
 
   const port = process.env.PORT || 5000;
   app.listen(port, () => console.log(`🚀 השרת רץ על פורט ${port}`));

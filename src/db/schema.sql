@@ -6,7 +6,8 @@ DROP TABLE IF EXISTS announcements, transactions, buildings, users CASCADE;
 -- משתמשים: ועד/גזבר (admin) ודיירים (resident)
 -- admin: מנהל בניין אחד או יותר (ראו buildings.manager_id), בלי דירה
 -- resident: שייך לבניין אחד ולדירה בו
--- התחברות: עם אימייל או עם טלפון - לכן לכל משתמש חייב להיות לפחות אחד מהם
+-- התחברות: עם אימייל או עם טלפון - לכן לוועד חייב להיות לפחות אחד מהם.
+-- דייר שהוועד הוסיף יכול להיות בלי שניהם (רשום רק לפי שם ודירה, ולא מתחבר)
 CREATE TABLE users (
   id          SERIAL PRIMARY KEY,
   full_name   TEXT        NOT NULL,
@@ -22,8 +23,8 @@ CREATE TABLE users (
 
   -- דייר חייב בניין ודירה
   CONSTRAINT resident_has_home CHECK (role <> 'resident' OR (building_id IS NOT NULL AND apartment IS NOT NULL)),
-  -- חייב להיות אימייל או טלפון (כדי שאפשר יהיה להתחבר)
-  CONSTRAINT has_login CHECK (email IS NOT NULL OR phone IS NOT NULL)
+  -- לוועד חייב להיות אימייל או טלפון (כדי שיוכל להתחבר)
+  CONSTRAINT admin_has_login CHECK (role <> 'admin' OR email IS NOT NULL OR phone IS NOT NULL)
 );
 
 -- בניינים: כל ועד יכול לנהל כמה בניינים
@@ -63,6 +64,7 @@ CREATE TABLE transactions (
   status          TEXT          NOT NULL DEFAULT 'paid'
                     CHECK (status IN ('paid','pending','late')),
   description     TEXT          CHECK (char_length(description) <= 500),
+  partial_of      INTEGER       REFERENCES transactions(id) ON DELETE SET NULL, -- יתרה של תשלום חלקי: מזהה התשלום ששולם
   created_by      INTEGER       REFERENCES users(id) ON DELETE SET NULL,
   created_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
   updated_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW(),

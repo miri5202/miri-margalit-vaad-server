@@ -121,8 +121,10 @@ function validateTransaction(input, building) {
 //   building חסר ← הרשמת ועד חדש: בלי דירה
 //   isNew: בהוספה הסיסמה חובה, בעדכון רק אם נשלחה
 //   requirePhone: בהצטרפות עם קוד - הטלפון חובה (איתו הדייר מתחבר)
-// אימייל וטלפון - כל אחד מהם לא חובה, אבל חייב להיות לפחות אחד (כדי שאפשר יהיה להתחבר)
-function validateUser(input, { isNew, building, requirePhone = false }) {
+//   requireLogin: חובה אימייל או טלפון (כדי שאפשר יהיה להתחבר). ברירת מחדל: כן.
+//                 כשהוועד מוסיף דייר - לא חובה: אפשר לרשום דייר רק לפי שם ודירה, בלי פרטי התחברות.
+//                 לדייר כזה גם אין צורך בסיסמה (הוא לא מתחבר למערכת).
+function validateUser(input, { isNew, building, requirePhone = false, requireLogin = true }) {
   const errors = {};
   const data = {
     fullName: toText(input.fullName),
@@ -137,11 +139,13 @@ function validateUser(input, { isNew, building, requirePhone = false }) {
   if (data.email && !isValidEmail(data.email)) errors.email = 'כתובת אימייל לא תקינה';
   if (data.phone && !isValidPhone(data.phone)) errors.phone = 'מספר טלפון לא תקין';
   if (requirePhone && !data.phone) errors.phone = 'יש להזין מספר טלפון';
-  if (!data.email && !data.phone) {
+  const hasLogin = Boolean(data.email || data.phone);
+  if (requireLogin && !hasLogin) {
     errors.email = errors.email || 'יש להזין אימייל או טלפון';
     errors.phone = errors.phone || 'יש להזין אימייל או טלפון';
   }
-  if (isNew && !data.password) errors.password = 'סיסמה היא שדה חובה';
+  // סיסמה חובה רק למי שיכול להתחבר (יש לו אימייל או טלפון)
+  if (isNew && hasLogin && !data.password) errors.password = 'סיסמה היא שדה חובה';
   if (data.password && data.password.length < 6) errors.password = 'סיסמה חייבת להכיל לפחות 6 תווים';
 
   if (building) {
